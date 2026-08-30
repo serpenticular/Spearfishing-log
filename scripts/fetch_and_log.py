@@ -21,11 +21,22 @@ Designed to be run every ~6 hours by the GitHub Actions workflow in
 
 Data sources (all free, no API key required):
   - Open-Meteo Marine API   https://open-meteo.com/en/docs/marine-weather-api
-      swell height/period/direction, wind-wave height, sea surface temperature
+      swell height/period/direction, wind-wave height, sea surface temperature,
+      ocean current speed/direction, sea level height (tide proxy)
   - Open-Meteo Forecast API https://open-meteo.com/en/docs/
       wind speed/direction/gusts, rainfall
   - NOAA CoastWatch ERDDAP (best-effort, see fetch_chlorophyll)
       satellite chlorophyll-a, as a plankton/turbidity proxy
+
+Ocean current + sea level height were added after a round of research into
+what generally affects dive/spearfishing visibility (wind chop, rainfall
+runoff, swell/wave action, tidal current stirring sediment, algae blooms,
+bottom composition). Current speed is folded into the visibility score
+(higher current -> more resuspended sediment); sea level height is stored
+but NOT scored, since divers report tide effects are highly site-specific
+with no universal "high tide is better" rule - it's surfaced as raw
+rising/falling context instead. See README.md for the full write-up and
+sourcing.
 
 Notes / known limitations (see README.md for the full write-up):
   - Open-Meteo's marine model is a global wave model. For a sheltered,
@@ -60,7 +71,7 @@ ACTUAL_CSV = REPO_ROOT / "data" / "readings_actual.csv"
 FORECAST_CSV = REPO_ROOT / "data" / "forecast_latest.csv"
 
 PAST_HOURS_TO_CHECK = 48   # how far back we ask the API for, dedup handles overlap
-FORECAST_HOURS = 72        # how far ahead the forecast snapshot covers
+FORECAST_HOURS = 120       # how far ahead the forecast snapshot covers (5 days)
 PAST_DAYS = -(-PAST_HOURS_TO_CHECK // 24)      # ceil division -> days to request
 FORECAST_DAYS = -(-FORECAST_HOURS // 24) + 1   # ceil + 1 day buffer -> days to request
 HTTP_TIMEOUT = 30
@@ -69,6 +80,7 @@ USER_AGENT = "spearfishing-visibility-logger/1.0 (personal weather/visibility lo
 FIELDNAMES = [
     "visibility_score",
     "visibility_label",
+    "swell_band",
     "logged_at_utc",
     "location",
     "valid_time_utc",
@@ -82,6 +94,9 @@ FIELDNAMES = [
     "swell_dir_deg",
     "wave_height_m",
     "wind_wave_height_m",
+    "current_velocity_kmh",
+    "current_dir_deg",
+    "sea_level_height_m",
     "sea_surface_temp_c",
     "chlorophyll_mg_m3",
     "chlorophyll_source",
@@ -90,6 +105,7 @@ FIELDNAMES = [
 FORECAST_FIELDNAMES = [
     "visibility_score",
     "visibility_label",
+    "swell_band",
     "forecast_issued_at_utc",
     "lead_time_hours",
     "location",
@@ -104,6 +120,9 @@ FORECAST_FIELDNAMES = [
     "swell_dir_deg",
     "wave_height_m",
     "wind_wave_height_m",
+    "current_velocity_kmh",
+    "current_dir_deg",
+    "sea_level_height_m",
     "sea_surface_temp_c",
     "chlorophyll_mg_m3",
     "chlorophyll_source",
@@ -137,6 +156,9 @@ def fetch_marine(lat: float, lon: float) -> dict:
             "swell_wave_direction",
             "wind_wave_height",
             "sea_surface_temperature",
+            "ocean_current_velocity",
+            "ocean_current_direction",
+            "sea_level_height_msl",
         ]),
         "timezone": "Australia/Sydney",
         "past_days": PAST_DAYS,
@@ -205,12 +227,33 @@ def fetch_chlorophyll(lat: float, lon: float) -> tuple[float | None, str]:
 # score to see where it's over/under-calling conditions.
 
 WEIGHTS = {
-    "wind": 0.30,          # lower wind -> less chop / resuspended sediment
-    "rainfall": 0.25,      # less recent rain -> less runoff turbidity
+    "wind": 0.25,          # lower wind -> less chop / resuspended sediment
+    "rainfall": 0.20,      # less recent rain -> less runoff turbidity
     "swell": 0.20,         # lower swell/wave height -> less bottom disturbance
+    "current": 0.15,       # lower tidal current -> less resuspended sediment
     "sst_anomaly": 0.15,   # colder-than-recent-average SST -> possible upwelling
-    "chlorophyll": 0.10,   # lower chlorophyll -> less algae/plankton haze
+    "chlorophyll": 0.05,   # lower chlorophyll -> less algae/plankton haze
 }
+
+
+def swell_band(swell_height_m: float | None) -> str:
+    """
+    Diveability band from swell height, using thresholds supplied directly
+    by the user (their own on-the-water judgement, not a turbidity measure -
+    this is deliberately separate from the visibility_score above, which is
+    about water clarity, not sea state/comfort).
+    """
+    if swell_height_m is None:
+        return ""
+    if swell_height_m <= 0.3:
+        return "Amazing"
+    if swell_height_m <= 0.8:
+        return "Great"
+    if swell_height_m <= 1.2:
+        return "Doable"
+    if swell_height_m <= 1.5:
+        return "Bit dodgy"
+    return "Getting rough"
 
 
 def _linear_score(value: float, good_at: float, bad_at: float) -> float:
@@ -229,6 +272,7 @@ def compute_visibility(
     sst_c: float | None,
     sst_recent_avg_c: float | None,
     chlorophyll_mg_m3: float | None,
+    current_velocity_kmh: float | None = None,
 ) -> tuple[float | None, str]:
     scores: dict[str, float] = {}
 
@@ -240,6 +284,13 @@ def compute_visibility(
 
     if swell_or_wave_m is not None:
         scores["swell"] = _linear_score(swell_or_wave_m, good_at=0, bad_at=2.5)
+
+    if current_velocity_kmh is not None:
+        # Generic threshold, not tuned per site: a handful of these 35
+        # locations (e.g. Port Phillip Heads/The Rip) are known strong-current
+        # sites where this will correctly score "poor" near peak tidal flow
+        # even though the site can be excellent at slack water.
+        scores["current"] = _linear_score(current_velocity_kmh, good_at=0, bad_at=8)
 
     if sst_c is not None and sst_recent_avg_c is not None:
         anomaly = sst_recent_avg_c - sst_c  # positive = colder than recent avg
@@ -283,13 +334,17 @@ def load_existing_actual_keys() -> set[tuple[str, str]]:
         return {(r["location"], r["valid_time_utc"]) for r in csv.DictReader(f)}
 
 
-def migrate_column_order() -> None:
+def migrate_schema() -> None:
     """
-    Self-healing: if readings_actual.csv already exists with the same set of
-    columns but in an old order (e.g. before visibility_score/label moved to
-    the front), rewrite it in place with the current FIELDNAMES order rather
-    than requiring anyone to hand-edit a growing history file. A no-op once
-    the file is already in the current order.
+    Self-healing: if readings_actual.csv already exists with an old header -
+    columns in a different order (e.g. before visibility_score/label moved to
+    the front) and/or missing columns that were added later (e.g. the
+    current/tide fields) - rewrite it in place against the current
+    FIELDNAMES, rather than requiring anyone to hand-edit a growing history
+    file. Old rows get blank values for any newly-added columns. A no-op
+    once the file already matches FIELDNAMES exactly. Only ever adds/
+    reorders columns; if the on-disk header contains something FIELDNAMES
+    doesn't recognise at all, this leaves the file alone rather than guess.
     """
     if not ACTUAL_CSV.exists():
         return
@@ -298,11 +353,11 @@ def migrate_column_order() -> None:
         header = reader.fieldnames
         if header == FIELDNAMES:
             return  # already correct, nothing to do
-        if header is None or set(header) != set(FIELDNAMES):
-            return  # unexpected shape - leave it alone rather than guess
+        if header is None or not set(header).issubset(set(FIELDNAMES)):
+            return  # unexpected/unrecognised shape - leave it alone rather than guess
         rows = list(reader)
     write_rows(ACTUAL_CSV, FIELDNAMES, rows)
-    print(f"Migrated {ACTUAL_CSV} to the current column order.", file=sys.stderr)
+    print(f"Migrated {ACTUAL_CSV} to the current schema.", file=sys.stderr)
 
 
 def recent_sst_average(location: str, before_utc: str, days: int = 14) -> float | None:
@@ -391,6 +446,9 @@ def process_location(loc: dict, run_started_utc: str, existing_keys: set) -> tup
         swell_dir = m_hourly["swell_wave_direction"][i]
         wave_height = m_hourly["wave_height"][i]
         wind_wave_height = m_hourly["wind_wave_height"][i]
+        current_velocity = m_hourly.get("ocean_current_velocity", [None] * len(times_local))[i]
+        current_dir = m_hourly.get("ocean_current_direction", [None] * len(times_local))[i]
+        sea_level_height = m_hourly.get("sea_level_height_msl", [None] * len(times_local))[i]
         sst = m_hourly["sea_surface_temperature"][i]
 
         sst_avg = recent_sst_average(name, t_utc_str) if not is_future else None
@@ -401,6 +459,7 @@ def process_location(loc: dict, run_started_utc: str, existing_keys: set) -> tup
             sst_c=sst,
             sst_recent_avg_c=sst_avg,
             chlorophyll_mg_m3=chlor_value,
+            current_velocity_kmh=current_velocity,
         )
 
         row = {
@@ -416,11 +475,15 @@ def process_location(loc: dict, run_started_utc: str, existing_keys: set) -> tup
             "swell_dir_deg": swell_dir,
             "wave_height_m": wave_height,
             "wind_wave_height_m": wind_wave_height,
+            "current_velocity_kmh": current_velocity if current_velocity is not None else "",
+            "current_dir_deg": current_dir if current_dir is not None else "",
+            "sea_level_height_m": sea_level_height if sea_level_height is not None else "",
             "sea_surface_temp_c": sst,
             "chlorophyll_mg_m3": chlor_value if chlor_value is not None else "",
             "chlorophyll_source": chlor_source,
             "visibility_score": score if score is not None else "",
             "visibility_label": label,
+            "swell_band": swell_band(swell_height),
             "notes": "",
         }
 
@@ -447,7 +510,7 @@ def main() -> None:
         print("No active locations in locations.csv - nothing to do.", file=sys.stderr)
         return
 
-    migrate_column_order()
+    migrate_schema()
     existing_keys = load_existing_actual_keys()
     all_new_actuals: list[dict] = []
     all_forecast_rows: list[dict] = []
