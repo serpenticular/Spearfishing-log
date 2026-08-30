@@ -67,6 +67,8 @@ HTTP_TIMEOUT = 30
 USER_AGENT = "spearfishing-visibility-logger/1.0 (personal weather/visibility log)"
 
 FIELDNAMES = [
+    "visibility_score",
+    "visibility_label",
     "logged_at_utc",
     "location",
     "valid_time_utc",
@@ -83,11 +85,30 @@ FIELDNAMES = [
     "sea_surface_temp_c",
     "chlorophyll_mg_m3",
     "chlorophyll_source",
-    "visibility_score",
-    "visibility_label",
     "notes",
 ]
-FORECAST_FIELDNAMES = ["forecast_issued_at_utc", "lead_time_hours"] + FIELDNAMES[1:]
+FORECAST_FIELDNAMES = [
+    "visibility_score",
+    "visibility_label",
+    "forecast_issued_at_utc",
+    "lead_time_hours",
+    "location",
+    "valid_time_utc",
+    "valid_time_local",
+    "wind_speed_kmh",
+    "wind_dir_deg",
+    "wind_gust_kmh",
+    "rainfall_mm",
+    "swell_height_m",
+    "swell_period_s",
+    "swell_dir_deg",
+    "wave_height_m",
+    "wind_wave_height_m",
+    "sea_surface_temp_c",
+    "chlorophyll_mg_m3",
+    "chlorophyll_source",
+    "notes",
+]
 
 
 # --------------------------------------------------------------------------
@@ -262,6 +283,28 @@ def load_existing_actual_keys() -> set[tuple[str, str]]:
         return {(r["location"], r["valid_time_utc"]) for r in csv.DictReader(f)}
 
 
+def migrate_column_order() -> None:
+    """
+    Self-healing: if readings_actual.csv already exists with the same set of
+    columns but in an old order (e.g. before visibility_score/label moved to
+    the front), rewrite it in place with the current FIELDNAMES order rather
+    than requiring anyone to hand-edit a growing history file. A no-op once
+    the file is already in the current order.
+    """
+    if not ACTUAL_CSV.exists():
+        return
+    with open(ACTUAL_CSV, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        header = reader.fieldnames
+        if header == FIELDNAMES:
+            return  # already correct, nothing to do
+        if header is None or set(header) != set(FIELDNAMES):
+            return  # unexpected shape - leave it alone rather than guess
+        rows = list(reader)
+    write_rows(ACTUAL_CSV, FIELDNAMES, rows)
+    print(f"Migrated {ACTUAL_CSV} to the current column order.", file=sys.stderr)
+
+
 def recent_sst_average(location: str, before_utc: str, days: int = 14) -> float | None:
     """Rolling average SST from our own accumulated actuals, used as the
     'normal for this time of year, at this place' baseline for the upwelling
@@ -404,6 +447,7 @@ def main() -> None:
         print("No active locations in locations.csv - nothing to do.", file=sys.stderr)
         return
 
+    migrate_column_order()
     existing_keys = load_existing_actual_keys()
     all_new_actuals: list[dict] = []
     all_forecast_rows: list[dict] = []
