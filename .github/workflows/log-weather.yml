@@ -36,10 +36,38 @@ jobs:
         run: |
           git config user.name "spearfishing-bot"
           git config user.email "actions@users.noreply.github.com"
+
+          # This job's fetch step above takes several minutes. If another
+          # commit lands on main in the meantime (a manual edit, or an
+          # overlapping run), a plain "git push" gets rejected as a
+          # non-fast-forward. Pull in anything new before committing so our
+          # push is a fast-forward in the common case.
+          git fetch origin main
+          git merge --no-edit origin/main
+
           git add data/
           if git diff --cached --quiet; then
             echo "No new data this run."
-          else
-            git commit -m "Log weather data $(date -u +'%Y-%m-%dT%H:%MZ')"
-            git push
+            exit 0
           fi
+
+          git commit -m "Log weather data $(date -u +'%Y-%m-%dT%H:%MZ')"
+
+          # Belt-and-braces: if main still moved in the brief window between
+          # the merge above and this push, retry with a rebase a few times
+          # rather than losing this run's data.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt) - fetching and rebasing onto latest main..."
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort
+              echo "Rebase conflict - giving up for this run rather than risking a bad merge."
+              exit 1
+            fi
+            sleep $((5 * attempt))
+          done
+          echo "Failed to push after retries."
+          exit 1
