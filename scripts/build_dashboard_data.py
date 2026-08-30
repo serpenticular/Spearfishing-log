@@ -91,6 +91,29 @@ def to_float(v):
         return None
 
 
+# CSV rows come back from csv.DictReader as all-string dicts. These are the
+# columns that are actually numbers - anything logged straight into the
+# "current" block for the dashboard JSON needs these cast, or every consumer
+# (the app's JS included) gets strings where it expects numbers.
+NUMERIC_ROW_FIELDS = {
+    "visibility_score", "lead_time_hours", "wind_speed_kmh", "wind_dir_deg",
+    "wind_gust_kmh", "rainfall_mm", "swell_height_m", "swell_period_s",
+    "swell_dir_deg", "wave_height_m", "wind_wave_height_m",
+    "current_velocity_kmh", "current_dir_deg", "sea_level_height_m",
+    "sea_surface_temp_c", "chlorophyll_mg_m3",
+}
+
+
+def numeric_row(r: dict | None) -> dict | None:
+    if r is None:
+        return None
+    out = dict(r)
+    for k in NUMERIC_ROW_FIELDS:
+        if k in out:
+            out[k] = to_float(out[k])
+    return out
+
+
 def parse_utc(s: str) -> dt.datetime:
     return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
 
@@ -165,7 +188,7 @@ def build():
         all_rows = a_rows + f_rows  # actual (past/now) + forecast (future), already time-ordered within each
 
         # ---- current conditions: latest actual row (or earliest forecast if none) ----
-        current = a_rows[-1] if a_rows else (f_rows[0] if f_rows else None)
+        current = numeric_row(a_rows[-1] if a_rows else (f_rows[0] if f_rows else None))
 
         # ---- per-day (today..+4) morning-window (06:00-12:00 local) summary ----
         days = []
