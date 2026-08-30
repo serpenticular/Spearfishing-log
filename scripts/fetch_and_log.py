@@ -140,7 +140,7 @@ HTTP_RETRY_BACKOFF_S = 3  # doubles each retry: 3s, 6s
 
 
 def http_get_json(url: str) -> dict:
-    """GET url as JSON, retrying transient network/SSL hiccups.
+    """GET url as JSON, retrying transient network/SSL hiccups only.
 
     Sequential runs of 70-100+ requests per job (35 locations x 2-3 calls
     each) occasionally hit an isolated SSL handshake timeout against
@@ -148,9 +148,19 @@ def http_get_json(url: str) -> dict:
     practice as a handful of "<urlopen error ... handshake operation timed
     out>" failures per run, each silently dropping that location's data for
     the whole 6-hour cycle. A couple of short retries clears essentially
-    all of these without masking a genuinely bad URL or a real HTTP error
-    from the API (those still raise immediately - only URLError, which
-    covers timeouts/connection resets, is retried).
+    all of these.
+
+    IMPORTANT: urllib.error.HTTPError (a real HTTP response - 404, 429, 500,
+    etc.) is a *subclass* of URLError, but is deliberately NOT retried here.
+    An early version of this retry loop caught HTTPError too, which turned
+    a burst of 404s (seen in testing after several manual runs in quick
+    succession - most likely Open-Meteo rate-limiting/blocking the shared
+    GitHub Actions IP range rather than anything wrong with the request)
+    into 3x as many requests and a much slower failure, without ever having
+    a chance of succeeding. Only a connection-level failure (timeout, DNS,
+    connection reset - a plain URLError, not an HTTPError) is worth retrying;
+    an HTTP error response should fail this location fast, same as before
+    this retry logic existed.
     """
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     last_exc: urllib.error.URLError | None = None
@@ -158,6 +168,8 @@ def http_get_json(url: str) -> dict:
         try:
             with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError:
+            raise  # real HTTP response (404/429/5xx/...) - fail fast, don't retry
         except urllib.error.URLError as exc:
             last_exc = exc
             if attempt < HTTP_MAX_ATTEMPTS:
