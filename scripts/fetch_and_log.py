@@ -60,6 +60,7 @@ import csv
 import datetime as dt
 import json
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -134,10 +135,37 @@ FORECAST_FIELDNAMES = [
 # HTTP helper
 # --------------------------------------------------------------------------
 
+HTTP_MAX_ATTEMPTS = 3  # 1 try + 2 retries
+HTTP_RETRY_BACKOFF_S = 3  # doubles each retry: 3s, 6s
+
+
 def http_get_json(url: str) -> dict:
+    """GET url as JSON, retrying transient network/SSL hiccups.
+
+    Sequential runs of 70-100+ requests per job (35 locations x 2-3 calls
+    each) occasionally hit an isolated SSL handshake timeout against
+    Open-Meteo/ERDDAP with no fault of the location itself - seen in
+    practice as a handful of "<urlopen error ... handshake operation timed
+    out>" failures per run, each silently dropping that location's data for
+    the whole 6-hour cycle. A couple of short retries clears essentially
+    all of these without masking a genuinely bad URL or a real HTTP error
+    from the API (those still raise immediately - only URLError, which
+    covers timeouts/connection resets, is retried).
+    """
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    last_exc: urllib.error.URLError | None = None
+    for attempt in range(1, HTTP_MAX_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            last_exc = exc
+            if attempt < HTTP_MAX_ATTEMPTS:
+                wait_s = HTTP_RETRY_BACKOFF_S * (2 ** (attempt - 1))
+                print(f"  (retrying after {exc} - attempt {attempt}/{HTTP_MAX_ATTEMPTS})", file=sys.stderr)
+                time.sleep(wait_s)
+    assert last_exc is not None
+    raise last_exc
 
 
 # --------------------------------------------------------------------------
