@@ -1,0 +1,5 @@
+# fetch_and_log.py only uses the Python standard library (urllib, csv, json),
+# so there is nothing to install. This file exists so the GitHub Actions
+# workflow's "pip install -r requirements.txt" step has something to point
+# at, and so future data sources (e.g. an authenticated marine API client)
+# have an obvious place to be added.
