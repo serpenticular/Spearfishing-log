@@ -24,9 +24,17 @@ Data sources (all free, no API key required):
       swell height/period/direction, wind-wave height, sea surface temperature,
       ocean current speed/direction, sea level height (tide proxy)
   - Open-Meteo Forecast API https://open-meteo.com/en/docs/
-      wind speed/direction/gusts, rainfall
+      wind speed/direction/gusts, rainfall, air temperature, weather code
+      (added 2026-10-14 so the Compare page's weather strip is real data,
+      not a placeholder - same API call as wind/rain, no extra request)
   - NOAA CoastWatch ERDDAP (best-effort, see fetch_chlorophyll)
       satellite chlorophyll-a, as a plankton/turbidity proxy
+
+Red Point (-37.083, 149.950) was added 2026-10-14 purely as a swell/wave data
+source for Eden, which has never returned usable swell/wave figures at its own
+coordinates (see README/project notes) - it is logged like any other location
+but flagged role=swell_reference in locations.csv so the dashboard/compare
+builders can fetch its data without listing it as its own dive site.
 
 Ocean current + sea level height were added after a round of research into
 what generally affects dive/spearfishing visibility (wind chop, rainfall
@@ -71,10 +79,16 @@ LOCATIONS_CSV = REPO_ROOT / "locations.csv"
 ACTUAL_CSV = REPO_ROOT / "data" / "readings_actual.csv"
 FORECAST_CSV = REPO_ROOT / "data" / "forecast_latest.csv"
 
-PAST_HOURS_TO_CHECK = 48   # how far back we ask the API for, dedup handles overlap
-FORECAST_HOURS = 120       # how far ahead the forecast snapshot covers (5 days)
+PAST_HOURS_TO_CHECK = 96   # how far back we ask the API for, dedup handles overlap (4 days)
+FORECAST_HOURS = 168       # how far ahead the forecast snapshot covers (7 days)
 PAST_DAYS = -(-PAST_HOURS_TO_CHECK // 24)      # ceil division -> days to request
 FORECAST_DAYS = -(-FORECAST_HOURS // 24) + 1   # ceil + 1 day buffer -> days to request
+# FORECAST_DAYS resolves to 8, which is the Marine API's documented forecast_days
+# cap (its own parameter table lists 0-8 despite other text on the same page
+# claiming "up to 16 days possible" - an unresolved doc inconsistency). 8 is the
+# safe, spec-table value; going higher risks a hard failure on the marine call
+# for every one of the 36 locations each run, so this deliberately does not
+# chase the higher number without a live boundary test first.
 HTTP_TIMEOUT = 30
 USER_AGENT = "spearfishing-visibility-logger/1.0 (personal weather/visibility log)"
 
@@ -86,6 +100,8 @@ FIELDNAMES = [
     "location",
     "valid_time_utc",
     "valid_time_local",
+    "air_temp_c",
+    "weather_code",
     "wind_speed_kmh",
     "wind_dir_deg",
     "wind_gust_kmh",
@@ -112,6 +128,8 @@ FORECAST_FIELDNAMES = [
     "location",
     "valid_time_utc",
     "valid_time_local",
+    "air_temp_c",
+    "weather_code",
     "wind_speed_kmh",
     "wind_dir_deg",
     "wind_gust_kmh",
@@ -209,7 +227,7 @@ def fetch_marine(lat: float, lon: float) -> dict:
 
 
 def fetch_weather(lat: float, lon: float) -> dict:
-    """Open-Meteo Forecast API: wind + rainfall."""
+    """Open-Meteo Forecast API: wind + rainfall + general weather (temp/sky)."""
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -218,6 +236,8 @@ def fetch_weather(lat: float, lon: float) -> dict:
             "wind_direction_10m",
             "wind_gusts_10m",
             "precipitation",
+            "temperature_2m",
+            "weather_code",
         ]),
         "timezone": "Australia/Sydney",
         "past_days": PAST_DAYS,
@@ -480,6 +500,8 @@ def process_location(loc: dict, run_started_utc: str, existing_keys: set) -> tup
         wind_gust = w_hourly["wind_gusts_10m"][i]
         rainfall = w_hourly["precipitation"][i]
         rainfall_24h = sum(rainfall_series[max(0, i - 23): i + 1])
+        air_temp = w_hourly.get("temperature_2m", [None] * len(times_local))[i]
+        weather_code = w_hourly.get("weather_code", [None] * len(times_local))[i]
 
         swell_height = m_hourly["swell_wave_height"][i]
         swell_period = m_hourly["swell_wave_period"][i]
@@ -506,6 +528,8 @@ def process_location(loc: dict, run_started_utc: str, existing_keys: set) -> tup
             "location": name,
             "valid_time_utc": t_utc_str,
             "valid_time_local": t_local_str,
+            "air_temp_c": air_temp if air_temp is not None else "",
+            "weather_code": weather_code if weather_code is not None else "",
             "wind_speed_kmh": wind_speed,
             "wind_dir_deg": wind_dir,
             "wind_gust_kmh": wind_gust,
